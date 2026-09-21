@@ -1,4 +1,3 @@
-import asyncio
 import json
 import os
 import re
@@ -7,7 +6,16 @@ from html import escape
 from aiohttp import web
 from aiogram import Bot, Dispatcher, F
 from aiogram.filters import Command, CommandStart
-from aiogram.types import Message, CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup
+from aiogram.types import (
+    Message,
+    CallbackQuery,
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
+)
+from aiogram.webhook.aiohttp_server import (
+    SimpleRequestHandler,
+    setup_application,
+)
 from rapidfuzz import fuzz
 
 
@@ -29,7 +37,7 @@ def normalize(text: str) -> str:
     text = re.sub(
         r"\b(улица|ул|проспект|пр-т|переулок|пер|площадь|пл)\b",
         " ",
-        text
+        text,
     )
     text = re.sub(r"[^а-яa-z0-9]+", " ", text)
     return re.sub(r"\s+", " ", text).strip()
@@ -70,7 +78,6 @@ def find_matches(query: str, limit: int = 5):
 
 
 def clean_description(text: str) -> str:
-    """Убирает технические пометки из таблицы."""
     text = text or ""
 
     text = re.sub(r"\s*\[[^\]]+\]", "", text)
@@ -82,7 +89,6 @@ def clean_description(text: str) -> str:
 
 
 def format_entry(item: dict) -> str:
-    """Формирует читабельный ответ."""
     name = escape(item.get("name", "").strip())
     district = escape(item.get("district", "").strip())
     description = escape(
@@ -184,16 +190,18 @@ async def street_search(message: Message):
     buttons = []
 
     for score, item in matches[:5]:
-        buttons.append([
-            InlineKeyboardButton(
-                text=f"{item['name']} ({round(score)}%)",
-                callback_data=f"street:{STREETS.index(item)}"
-            )
-        ])
+        buttons.append(
+            [
+                InlineKeyboardButton(
+                    text=f"{item['name']} ({round(score)}%)",
+                    callback_data=f"street:{STREETS.index(item)}",
+                )
+            ]
+        )
 
     await message.answer(
         "Я нашёл несколько похожих названий. Выберите нужную улицу:",
-        reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons)
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons),
     )
 
 
@@ -206,7 +214,7 @@ async def street_callback(callback: CallbackQuery):
     except (ValueError, IndexError):
         await callback.answer(
             "Запись не найдена.",
-            show_alert=True
+            show_alert=True,
         )
         return
 
@@ -217,8 +225,11 @@ async def street_callback(callback: CallbackQuery):
 
 
 # --------------------------------------------------
-# HTTP-сервер для Render
+# WEBHOOK ДЛЯ RENDER
 # --------------------------------------------------
+
+WEBHOOK_PATH = "/telegram/webhook"
+
 
 async def health_check(request):
     return web.Response(
@@ -226,40 +237,80 @@ async def health_check(request):
     )
 
 
-async def start_web_server():
-    app = web.Application()
+async def on_startup(bot: Bot):
+    render_url = os.getenv("RENDER_EXTERNAL_URL")
 
-    app.router.add_get("/", health_check)
-    app.router.add_get("/health", health_check)
+    if not render_url:
+        raise RuntimeError(
+            "Переменная RENDER_EXTERNAL_URL не найдена."
+        )
 
-    runner = web.AppRunner(app)
-    await runner.setup()
+    webhook_url = f"{render_url}{WEBHOOK_PATH}"
 
-    port = int(os.getenv("PORT", "10000"))
-
-    site = web.TCPSite(
-        runner,
-        "0.0.0.0",
-        port
+    await bot.set_webhook(
+        url=webhook_url,
+        drop_pending_updates=True,
     )
 
-    await site.start()
+    print(f"Webhook установлен: {webhook_url}")
 
-    print(f"Web server started on port {port}")
+
+async def on_shutdown(bot: Bot):
+    await bot.delete_webhook()
+
+    print("Webhook удалён.")
 
 
 async def main():
     bot = Bot(BOT_TOKEN)
 
-    await start_web_server()
+    dp.startup.register(on_startup)
+    dp.shutdown.register(on_shutdown)
 
-    print("Telegram bot started.")
+    app = web.Application()
+
+    app.router.add_get("/", health_check)
+    app.router.add_get("/health", health_check)
+
+    webhook_handler = SimpleRequestHandler(
+        dispatcher=dp,
+        bot=bot,
+    )
+
+    webhook_handler.register(
+        app,
+        path=WEBHOOK_PATH,
+    )
+
+    setup_application(
+        app,
+        dp,
+        bot=bot,
+    )
+
+    port = int(os.getenv("PORT", "10000"))
+
+    runner = web.AppRunner(app)
+    await runner.setup()
+
+    site = web.TCPSite(
+        runner,
+        "0.0.0.0",
+        port,
+    )
+
+    await site.start()
+
+    print(f"Web server запущен на порту {port}")
 
     try:
-        await dp.start_polling(bot)
+        await asyncio.Event().wait()
     finally:
+        await runner.cleanup()
         await bot.session.close()
 
 
 if __name__ == "__main__":
+    import asyncio
+
     asyncio.run(main())
